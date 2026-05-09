@@ -1,2 +1,2 @@
-requests>=2.31.0
-yt-dlp>=2024.0.0
+pyTelegramBotAPI==4.15.2
+yt-dlp==2024.03.10
