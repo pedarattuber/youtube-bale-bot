@@ -1,0 +1,61 @@
+name: 🎬 YouTube Bale Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"  # هر ۵ دقیقه
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: 'لینک تست (اختیاری)'
+        required: false
+        default: ''
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: 🎬 Setup FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg > /dev/null 2>&1
+          ffmpeg -version | head -1
+      
+      - name: 📦 Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: 🍪 Setup YouTube Cookies
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo "${{ secrets.YOUTUBE_COOKIES }}" > ~/.youtube_cookies.txt
+            echo "✅ Cookies loaded"
+          else
+            echo "⚠️ No cookies found - age-restricted videos won't work"
+          fi
+      
+      - name: 🤖 Run Bot
+        env:
+          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: python bot.py
+      
+      - name: 💾 Save offset
+        if: always()
+        run: |
+          git config user.name "Bot"
+          git config user.email "bot@github.com"
+          cp ~/.youtube_bale_bot_offset.txt offset.txt 2>/dev/null || true
+          git add offset.txt 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "📝 Update offset [skip ci]"
+          git push || true
