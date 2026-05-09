@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-🎬 YouTube Downloader Bot for Bale (Fixed for Shorts & All Formats)
+🎬 YouTube Downloader Bot for Bale (FINAL FIX - Shorts & All Formats)
 Based on: github.com/pedarattuber/sandbox workflow logic
+Key Fix: Removed separate info extraction, download direct with ignoreerrors
 """
 
 import os
@@ -21,7 +22,7 @@ from datetime import datetime
 import requests
 
 # ==================== Configuration ====================
-BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "535471620:niU3L-UZs9dFrT_vSPn_1mCPgQi1YdmtQxM").strip()
+BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     sys.exit("❌ BALE_BOT_TOKEN environment variable is required!")
 
@@ -35,16 +36,14 @@ OFFSET_FILE = Path.home() / ".youtube_bale_bot_offset.txt"
 
 DEFAULT_QUALITY = "480p"
 
-# ==================== Quality Options (Fixed for Shorts compatibility) ====================
-# The key fix: use "best" as fallback for each height limit
-# This ensures Shorts and unusual formats are always downloadable
+# ==================== Quality Options ====================
 QUALITY_OPTIONS = {
-    "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/bestvideo[height<=2160]/best",
-    "1440p": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/bestvideo[height<=1440]/best",
-    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo[height<=1080]/best",
-    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo[height<=720]/best",
-    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/bestvideo[height<=480]/best",
-    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/bestvideo[height<=360]/best",
+    "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+    "1440p": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
     "audio": "bestaudio/best",
 }
 
@@ -100,7 +99,6 @@ def setup_cookies():
 # ==================== Bale API ====================
 def test_bot_token():
     url = f"https://tapi.bale.ai/bot{BOT_TOKEN}/getMe"
-    log(f"Testing token...", "DEBUG")
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
@@ -245,8 +243,14 @@ def check_ffmpeg():
     log("No FFmpeg", "WARN")
     return False
 
-# ==================== YouTube Downloader (Fixed) ====================
+# ==================== YouTube Downloader (FINAL FIX) ====================
 class YouTubeDownloader:
+    """
+    Downloads YouTube videos with auto-fallback format selection.
+    KEY FIX: No separate info extraction - download directly.
+    If format not available, automatically retries with 'best'.
+    """
+    
     def __init__(self):
         self.temp_dir = get_temp_dir()
     
@@ -267,31 +271,10 @@ class YouTubeDownloader:
         match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})', url)
         return match.group(1) if match else None
     
-    def get_video_info(self, url):
-        """Get video info with flexible format detection"""
-        try:
-            from yt_dlp import YoutubeDL
-            opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "noplaylist": True,
-                "ignoreerrors": False,
-            }
-            if COOKIE_FILE.exists():
-                opts["cookiefile"] = str(COOKIE_FILE)
-            
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                return info
-        except Exception as e:
-            log(f"Info error: {e}", "ERROR")
-            return None
-    
     def download_video(self, url, quality=DEFAULT_QUALITY, progress_callback=None):
         """
-        Download YouTube video with auto-fallback for Shorts
-        The key fix: if format fails, automatically try best-available format
+        Download YouTube video DIRECTLY without separate info extraction.
+        Uses automatic fallback if selected format is not available.
         """
         self._cleanup()
         
@@ -304,155 +287,150 @@ class YouTubeDownloader:
                 return None, "Invalid YouTube URL"
             
             if progress_callback:
-                progress_callback(5, "دریافت اطلاعات...")
+                progress_callback(5, "شروع دانلود...")
             
-            # Try to get info
-            info = self.get_video_info(url)
-            if not info:
-                return None, "ویدیو در دسترس نیست (ممکنه خصوصی یا حذف شده باشه)"
-            
-            title = info.get("title", "Unknown")
-            duration = info.get("duration", 0) or 0
-            uploader = info.get("uploader", "Unknown")
-            safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:120]
-            
-            # Check if it's a Short
-            is_short = "/shorts/" in url.lower()
-            
-            # Format selection
             is_audio = (quality == "audio")
+            
+            # Try format strings in order of preference
+            format_attempts = []
+            
             if is_audio:
-                format_str = QUALITY_OPTIONS["audio"]
+                format_attempts = [
+                    "bestaudio/best",
+                    "best",
+                ]
             else:
-                format_str = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS[DEFAULT_QUALITY])
+                # Primary: user's chosen quality format string
+                primary_fmt = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS[DEFAULT_QUALITY])
                 
-                # For Shorts, use a more flexible format selection
-                if is_short:
-                    log(f"Detected Shorts video, using flexible format", "DEBUG")
-                    # For Shorts: prefer vertical video, fall back to best
-                    format_str = f"best[height<={get_quality_height(quality)}]/best"
+                # Build fallback chain
+                format_attempts = [
+                    primary_fmt,
+                    "bestvideo+bestaudio/best",
+                    "best",
+                    "worst",
+                ]
             
-            ext = "m4a" if is_audio else "mp4"
-            output_template = str(self.temp_dir / f"{safe_title}.%(ext)s")
-            
-            # Build options
-            opts = {
-                "outtmpl": output_template,
-                "format": format_str,
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "ignoreerrors": False,
-                "retries": 10,
-                "fragment_retries": 10,
-                "extractor_retries": 5,
-                "socket_timeout": 60,
-                "merge_output_format": ext if not is_audio else None,
-                "allow_unplayable_formats": True,  # Allow any format
-                "format_sort": ["res", "codec:h264"],  # Prefer H.264 for compatibility
-            }
-            
-            if is_audio:
-                opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
-            
-            if COOKIE_FILE.exists():
-                opts["cookiefile"] = str(COOKIE_FILE)
-            
-            # Progress hook
-            if progress_callback:
-                last_percent = [0]
-                def hook(d):
-                    if d.get("status") == "downloading":
-                        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                        if total > 0:
-                            pct = min(int((d.get("downloaded_bytes", 0) / total) * 90) + 5, 95)
-                            if pct > last_percent[0] + 4:
-                                last_percent[0] = pct
-                                speed = d.get("speed") or 0
-                                if speed > 1024*1024:
-                                    speed_str = f"{speed/1024/1024:.1f} MB/s"
-                                elif speed > 1024:
-                                    speed_str = f"{speed/1024:.0f} KB/s"
-                                else:
-                                    speed_str = ""
-                                progress_callback(pct, f"دانلود... {speed_str}")
-                    elif d.get("status") == "finished":
-                        progress_callback(95, "پردازش نهایی...")
-                opts["progress_hooks"] = [hook]
-            
-            # Download with auto-fallback logic
-            if progress_callback:
-                progress_callback(10, "شروع دانلود...")
-            
-            download_success = False
             last_error = None
             
-            # Try 1: User's preferred format
-            try:
-                with YoutubeDL(opts) as ydl:
-                    ydl.download([url])
-                download_success = True
-            except DownloadError as e:
-                last_error = str(e)
-                log(f"First attempt failed: {last_error[:200]}", "WARN")
+            for attempt_idx, fmt in enumerate(format_attempts):
+                if attempt_idx > 0 and progress_callback:
+                    progress_callback(8, f"تلاش {attempt_idx+1} با فرمت جایگزین...")
                 
-                # Try 2: Fallback to best available format
-                if "Requested format is not available" in last_error or "format" in last_error.lower():
-                    log("Trying fallback: best format...", "WARN")
-                    if progress_callback:
-                        progress_callback(15, "تلاش مجدد با فرمت جایگزین...")
+                # Create unique output filename per attempt
+                attempt_suffix = f"_try{attempt_idx}" if attempt_idx > 0 else ""
+                output_template = str(self.temp_dir / f"%(title)s{attempt_suffix}.%(ext)s")
+                
+                opts = {
+                    "outtmpl": output_template,
+                    "format": fmt,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "ignoreerrors": True,  # THIS IS KEY: don't crash on format error
+                    "retries": 5,
+                    "fragment_retries": 5,
+                    "extractor_retries": 3,
+                    "socket_timeout": 60,
+                    "merge_output_format": "mp4" if not is_audio else None,
+                    "format_sort": ["res", "codec:h264"],
+                }
+                
+                if is_audio:
+                    opts["postprocessors"] = [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "m4a",
+                    }]
+                
+                if COOKIE_FILE.exists():
+                    opts["cookiefile"] = str(COOKIE_FILE)
+                
+                # Progress hook
+                if progress_callback:
+                    last_percent = [0]
+                    def hook(d):
+                        if d.get("status") == "downloading":
+                            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                            if total > 0:
+                                pct = min(int((d.get("downloaded_bytes", 0) / total) * 85) + 10, 95)
+                                if pct > last_percent[0] + 4:
+                                    last_percent[0] = pct
+                                    speed = d.get("speed") or 0
+                                    if speed > 1024*1024:
+                                        speed_str = f"{speed/1024/1024:.1f} MB/s"
+                                    elif speed > 1024:
+                                        speed_str = f"{speed/1024:.0f} KB/s"
+                                    else:
+                                        speed_str = ""
+                                    progress_callback(pct, f"دانلود... {speed_str}")
+                        elif d.get("status") == "finished":
+                            progress_callback(96, "پردازش نهایی...")
+                    opts["progress_hooks"] = [hook]
+                
+                try:
+                    with YoutubeDL(opts) as ydl:
+                        ydl.download([url])
                     
-                    opts["format"] = "best[ext=mp4]/best"
-                    if is_audio:
-                        opts["format"] = "bestaudio/best"
+                    # Check if download succeeded
+                    downloaded = list(self.temp_dir.glob("*"))
+                    downloaded = [f for f in downloaded if f.is_file() and not f.name.startswith('.')]
                     
-                    try:
-                        with YoutubeDL(opts) as ydl:
-                            ydl.download([url])
-                        download_success = True
-                        log("Fallback format succeeded!", "SUCCESS")
-                    except DownloadError as e2:
-                        last_error = str(e2)
-                        log(f"Fallback also failed: {last_error[:200]}", "ERROR")
+                    # Filter out info files
+                    media_files = [f for f in downloaded if f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.m4a', '.mp3', '.opus', '.aac', '.flac', '.wav')]
+                    
+                    if media_files:
+                        file_path = media_files[0]
+                        file_size = file_path.stat().st_size
+                        
+                        if progress_callback:
+                            progress_callback(100, "✅ کامل شد")
+                        
+                        # Try to extract title from filename
+                        title = file_path.stem
+                        # Remove attempt suffix
+                        title = re.sub(r'_try\d+$', '', title)
+                        
+                        return {
+                            "path": str(file_path),
+                            "name": file_path.name,
+                            "size": file_size,
+                            "title": title,
+                            "duration": 0,
+                            "uploader": "YouTube",
+                            "is_audio": is_audio,
+                            "video_id": video_id,
+                            "quality": quality if attempt_idx == 0 else "best",
+                        }, None
+                    else:
+                        last_error = "No media file downloaded"
+                        continue
+                        
+                except DownloadError as e:
+                    error_str = str(e)
+                    if "format" in error_str.lower() or "not available" in error_str.lower():
+                        last_error = error_str
+                        continue  # Try next format
+                    else:
+                        # Real error (video unavailable, private, etc.)
+                        if "Video unavailable" in error_str:
+                            return None, "ویدیو در دسترس نیست"
+                        elif "Private" in error_str:
+                            return None, "ویدیو خصوصی است"
+                        elif "removed" in error_str.lower():
+                            return None, "ویدیو حذف شده"
+                        elif "copyright" in error_str.lower():
+                            return None, "ویدیو به دلیل کپی‌رایت مسدود شده"
+                        else:
+                            return None, f"خطا: {error_str[:200]}"
             
-            if not download_success:
-                return None, f"فرمت درخواستی موجود نیست: {last_error[:150]}"
-            
-            # Find downloaded file
-            downloaded = list(self.temp_dir.glob(f"{safe_title}*.{ext}"))
-            if not downloaded:
-                downloaded = list(self.temp_dir.glob(f"{safe_title}*.*"))
-            if not downloaded:
-                downloaded = [f for f in self.temp_dir.glob("*") if f.is_file() and not f.name.startswith('.')]
-            
-            if not downloaded:
-                return None, "فایل دانلود شده یافت نشد"
-            
-            file_path = downloaded[0]
-            file_size = file_path.stat().st_size
-            
-            if progress_callback:
-                progress_callback(100, "✅ کامل شد")
-            
-            return {
-                "path": str(file_path),
-                "name": file_path.name,
-                "size": file_size,
-                "title": title,
-                "duration": duration,
-                "uploader": uploader,
-                "is_audio": is_audio,
-                "video_id": video_id,
-                "quality": quality,
-            }, None
+            # All attempts failed
+            if last_error:
+                return None, f"دانلود ناموفق: {str(last_error)[:200]}"
+            return None, "دانلود ناموفق - همه روش‌ها شکست خوردند"
             
         except Exception as e:
             log(f"Download exception: {traceback.format_exc()}", "ERROR")
-            return None, f"خطای غیرمنتظره: {str(e)[:200]}"
-
-def get_quality_height(quality_str):
-    """Extract height from quality string"""
-    return int(quality_str.replace("p", "")) if quality_str != "audio" else 0
+            return None, f"خطای سیستمی: {str(e)[:200]}"
 
 # ==================== File Splitting ====================
 def split_file_into_chunks(file_path, file_name, chunk_size=CHUNK_SIZE):
@@ -530,6 +508,7 @@ class BaleYouTubeBot:
                     "• `360p لینک` - `480p لینک` - `720p لینک` - `1080p لینک`\n"
                     "• `audio لینک` - فقط صوت\n\n"
                     "⚡ Shorts خودکار تشخیص داده میشه\n"
+                    "🔄 اگه فرمت انتخابی موجود نباشه، خودکار جایگزین میشه\n"
                     "📦 >19MB تکه‌تکه ارسال میشه\n\n"
                     "💡 `/help` راهنما | `/quality` کیفیت‌ها",
                     reply_to=message_id)
@@ -537,20 +516,18 @@ class BaleYouTubeBot:
             elif text in ("/quality", "/کیفیت"):
                 send_message(chat_id,
                     "⚙️ **کیفیت‌های موجود:**\n\n"
-                    "🎵 `audio` - فقط صوت (کمترین حجم)\n"
-                    "📱 `360p` - حجم کم، سریع\n"
+                    "🎵 `audio` - فقط صوت\n"
+                    "📱 `360p` - حجم کم\n"
                     "📺 `480p` - متوسط (پیش‌فرض)\n"
                     "🖥️ `720p` - خوب\n"
-                    "🎬 `1080p` - عالی\n"
-                    "🎥 `1440p` - خیلی عالی\n"
-                    "📽️ `2160p` - 4K\n\n"
+                    "🎬 `1080p` - عالی\n\n"
                     f"💡 فعلی: **{DEFAULT_QUALITY}**",
                     reply_to=message_id)
             
             elif text == "/cookie":
                 if COOKIE_FILE.exists():
                     lines = [l for l in COOKIE_FILE.read_text().split('\n') if not l.startswith('#') and l.strip()]
-                    send_message(chat_id, f"✅ کوکی فعال: {len(lines)} خط", reply_to=message_id)
+                    send_message(chat_id, f"✅ کوکی: {len(lines)} خط", reply_to=message_id)
                 else:
                     send_message(chat_id, "❌ کوکی یافت نشد", reply_to=message_id)
             
@@ -561,9 +538,9 @@ class BaleYouTubeBot:
                     "۲. یا با کیفیت: `720p لینک`\n"
                     "۳. یا برای صوت: `audio لینک`\n\n"
                     "✅ Shorts خودکار تشخیص داده میشه\n"
-                    "✅ فرمت‌های نامعتبر خودکار جایگزین میشن\n\n"
-                    "📦 فایل‌های >۱۹MB تکه‌تکه میشن\n\n"
-                    "👨‍💻 @PedaretUploader",
+                    "✅ فرمت‌های نامعتبر خودکار جایگزین میشن\n"
+                    "✅ تا ۴ روش مختلف برای دانلود امتحان میشه\n\n"
+                    "📦 فایل‌های >۱۹MB تکه‌تکه میشن",
                     reply_to=message_id)
             
             elif text:
@@ -600,7 +577,7 @@ class BaleYouTubeBot:
         q_display = "🎵 صوت" if quality == "audio" else f"🎬 {quality}"
         
         status = send_message(chat_id,
-            f"{q_display}\n🔗 `{url}`\n\n{create_progress_bar(0)}\n⏳ دریافت اطلاعات...")
+            f"{q_display}\n🔗 `{url}`\n\n{create_progress_bar(0)}\n⏳ شروع دانلود...")
         
         if not status.get("ok"):
             return
@@ -635,10 +612,8 @@ class BaleYouTubeBot:
         file_size = result["size"]
         title = result["title"]
         is_audio = result["is_audio"]
-        duration = result["duration"]
-        dur_str = f"{duration//60}:{duration%60:02d}" if duration else "?"
         
-        caption = f"🎬 {title}\n👤 {result['uploader']}\n⏱ {dur_str}\n📦 {format_size(file_size)}"
+        caption = f"🎬 {title}\n👤 {result['uploader']}\n📦 {format_size(file_size)}"
         
         if file_size <= CHUNK_SIZE:
             progress(99, "📤 ارسال...")
@@ -669,9 +644,7 @@ class BaleYouTubeBot:
             
             send_message(chat_id,
                 f"✅ {total} بخش ارسال شد\n\n"
-                f"📌 ترکیب با دستور:\n"
-                f"`cat {Path(file_name).stem}.part*of{total}{Path(file_name).suffix} > {file_name}`\n\n"
-                f"🌐 یا سایت: https://pedaret-uploader.pages.dev",
+                f"📌 ترکیب: `cat {Path(file_name).stem}.part*of{total}{Path(file_name).suffix} > {file_name}`",
                 reply_to=message_id)
         
         self.downloader._cleanup()
@@ -679,15 +652,14 @@ class BaleYouTubeBot:
 def format_size(s):
     if s < 1024: return f"{s} B"
     elif s < 1024*1024: return f"{s/1024:.1f} KB"
-    elif s < 1024*1024*1024*1: return f"{s/(1024*1024):.1f} MB"
+    elif s < 1024*1024*1024: return f"{s/(1024*1024):.1f} MB"
     return f"{s/(1024*1024*1024):.2f} GB"
 
 # ==================== Entry Point ====================
 if __name__ == "__main__":
     log("=" * 60)
-    log("🎬 YouTube Downloader Bot for Bale (Shorts Fixed)")
+    log("🎬 YouTube Downloader Bot for Bale (FINAL FIX)")
     log("=" * 60)
-    log(f"Token: {BOT_TOKEN[:8]}...{BOT_TOKEN[-4:]}", "INFO")
     
     if not test_bot_token():
         sys.exit(1)
@@ -699,7 +671,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     call_bale_api("deleteWebhook")
-    log("Long polling mode", "INFO")
+    log("Long polling mode active", "INFO")
     
     bot = BaleYouTubeBot()
     
