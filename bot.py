@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-🎬 YouTube Downloader Bot for Bale (Debug Version)
+🎬 YouTube Downloader Bot for Bale (Fixed for Shorts & All Formats)
+Based on: github.com/pedarattuber/sandbox workflow logic
 """
 
 import os
@@ -9,7 +10,6 @@ import re
 import sys
 import json
 import time
-import base64
 import shutil
 import tempfile
 import zipfile
@@ -21,11 +21,11 @@ from datetime import datetime
 import requests
 
 # ==================== Configuration ====================
-# اولویت با environment variable، بعد توکن پیش‌فرض
-DEFAULT_TOKEN = "535471620:niU3L-UZs9dFrT_vSPn_1mCPgQi1YdmtQxM"
-BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "").strip() or DEFAULT_TOKEN
+BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "535471620:niU3L-UZs9dFrT_vSPn_1mCPgQi1YdmtQxM").strip()
+if not BOT_TOKEN:
+    sys.exit("❌ BALE_BOT_TOKEN environment variable is required!")
 
-CHUNK_SIZE = 19 * 1024 * 1024
+CHUNK_SIZE = 19 * 1024 * 1024  # 19 MB
 MAX_ITERATIONS = 30
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
@@ -35,16 +35,20 @@ OFFSET_FILE = Path.home() / ".youtube_bale_bot_offset.txt"
 
 DEFAULT_QUALITY = "480p"
 
+# ==================== Quality Options (Fixed for Shorts compatibility) ====================
+# The key fix: use "best" as fallback for each height limit
+# This ensures Shorts and unusual formats are always downloadable
 QUALITY_OPTIONS = {
-    "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
-    "1440p": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
-    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+    "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/bestvideo[height<=2160]/best",
+    "1440p": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/bestvideo[height<=1440]/best",
+    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo[height<=1080]/best",
+    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo[height<=720]/best",
+    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/bestvideo[height<=480]/best",
+    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/bestvideo[height<=360]/best",
     "audio": "bestaudio/best",
 }
 
+# ==================== URL Patterns ====================
 YT_PATTERN = re.compile(
     r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)'
     r'[a-zA-Z0-9_-]{11}',
@@ -58,7 +62,7 @@ def log(msg, level="INFO"):
     print(f"[{timestamp}] {emoji.get(level, '•')} {msg}")
     sys.stdout.flush()
 
-# ==================== Temp ====================
+# ==================== Temp Directory ====================
 def get_temp_dir():
     for path in [
         Path(tempfile.gettempdir()) / "yt_bale_bot",
@@ -67,7 +71,7 @@ def get_temp_dir():
     ]:
         try:
             path.mkdir(parents=True, exist_ok=True)
-            (path / ".test").write_text("ok")
+            (path / ".write_test").write_text("ok")
             return path
         except:
             continue
@@ -93,70 +97,39 @@ def setup_cookies():
     log("No cookies", "WARN")
     return False
 
-# ==================== Bale API with Full Debug ====================
+# ==================== Bale API ====================
 def test_bot_token():
-    """Test if bot token works"""
     url = f"https://tapi.bale.ai/bot{BOT_TOKEN}/getMe"
-    log(f"Testing token at: .../bot****/getMe", "DEBUG")
-    
+    log(f"Testing token...", "DEBUG")
     try:
         resp = requests.get(url, timeout=10)
-        log(f"HTTP Status: {resp.status_code}", "DEBUG")
-        
         if resp.status_code == 200:
             data = resp.json()
-            log(f"Response: {json.dumps(data, indent=2)[:300]}", "DEBUG")
             if data.get("ok"):
                 bot = data["result"]
                 log(f"✅ Bot: @{bot.get('username')} - {bot.get('first_name')}", "SUCCESS")
                 return True
-            else:
-                log(f"❌ API Error: {data.get('description')}", "ERROR")
-        elif resp.status_code == 404:
-            log("❌ Token invalid or bot not found (404)", "ERROR")
-        elif resp.status_code == 401:
-            log("❌ Unauthorized - wrong token (401)", "ERROR")
-        else:
-            log(f"❌ Unexpected status: {resp.status_code}", "ERROR")
-            log(f"Body: {resp.text[:200]}", "DEBUG")
+        log(f"❌ Token invalid (HTTP {resp.status_code})", "ERROR")
     except Exception as e:
         log(f"Connection error: {e}", "ERROR")
-    
     return False
 
 def call_bale_api(method, data=None, files=None, retries=3):
-    """Call Bale API with full debug on failure"""
     url = f"{BASE_URL}/{method}"
-    
     for attempt in range(retries):
         try:
             if files:
                 resp = requests.post(url, data=data, files=files, timeout=180)
             else:
                 resp = requests.post(url, json=data, timeout=30)
-            
-            if resp.status_code != 200:
-                log(f"HTTP {resp.status_code} for {method}: {resp.text[:200]}", "DEBUG")
-                if resp.status_code == 404:
-                    return {"ok": False, "description": "Not Found", "error_code": 404}
-                if attempt < retries - 1:
-                    time.sleep(2)
-                    continue
-            
-            result = resp.json()
-            
-            if not result.get("ok"):
-                desc = result.get("description", "")
-                log(f"API '{method}' failed: {desc}", "WARN")
-            
-            return result
-            
-        except Exception as e:
-            log(f"Request error [{method}]: {e}", "ERROR")
+            if resp.status_code == 200:
+                return resp.json()
             if attempt < retries - 1:
                 time.sleep(2)
-    
-    return {"ok": False, "description": "Max retries exceeded"}
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2)
+    return {"ok": False, "description": "Max retries"}
 
 def send_message(chat_id, text, reply_to=None):
     if len(text) <= 4000:
@@ -164,18 +137,14 @@ def send_message(chat_id, text, reply_to=None):
         if reply_to:
             payload["reply_to_message_id"] = reply_to
         return call_bale_api("sendMessage", data=payload)
-    
     parts = [text[i:i+3900] for i in range(0, len(text), 3900)]
-    for i, part in enumerate(parts):
-        prefix = f"بخش {i+1}/{len(parts)}\n\n" if len(parts) > 1 else ""
-        call_bale_api("sendMessage", data={"chat_id": str(chat_id), "text": prefix + part})
+    for part in parts:
+        call_bale_api("sendMessage", data={"chat_id": str(chat_id), "text": part})
         time.sleep(0.3)
 
 def edit_message(chat_id, message_id, text):
     return call_bale_api("editMessageText", data={
-        "chat_id": str(chat_id),
-        "message_id": message_id,
-        "text": text
+        "chat_id": str(chat_id), "message_id": message_id, "text": text
     })
 
 def send_document(chat_id, file_data, file_name, caption="", reply_to=None):
@@ -185,14 +154,12 @@ def send_document(chat_id, file_data, file_name, caption="", reply_to=None):
                 data = f.read()
         else:
             data = file_data
-        
         files = {"document": (file_name, data, "application/octet-stream")}
         payload = {"chat_id": str(chat_id)}
         if caption:
             payload["caption"] = caption[:1024]
         if reply_to:
             payload["reply_to_message_id"] = reply_to
-        
         return call_bale_api("sendDocument", data=payload, files=files)
     except Exception as e:
         log(f"Send doc error: {e}", "ERROR")
@@ -205,20 +172,15 @@ def send_video(chat_id, file_data, file_name, caption="", reply_to=None):
                 data = f.read()
         else:
             data = file_data
-        
         files = {"video": (file_name, data, "video/mp4")}
         payload = {"chat_id": str(chat_id), "supports_streaming": "true"}
         if caption:
             payload["caption"] = caption[:1024]
-        if reply_to:
-            payload["reply_to_message_id"] = reply_to
-        
         result = call_bale_api("sendVideo", data=payload, files=files)
         if result.get("ok"):
             return result
         return send_document(chat_id, file_data, file_name, caption, reply_to)
-    except Exception as e:
-        log(f"Send video error: {e}", "ERROR")
+    except:
         return send_document(chat_id, file_data, file_name, caption, reply_to)
 
 def send_audio_track(chat_id, file_data, file_name, caption="", reply_to=None):
@@ -228,20 +190,15 @@ def send_audio_track(chat_id, file_data, file_name, caption="", reply_to=None):
                 data = f.read()
         else:
             data = file_data
-        
         files = {"audio": (file_name, data, "audio/mpeg")}
         payload = {"chat_id": str(chat_id)}
         if caption:
             payload["caption"] = caption[:1024]
-        if reply_to:
-            payload["reply_to_message_id"] = reply_to
-        
         result = call_bale_api("sendAudio", data=payload, files=files)
         if result.get("ok"):
             return result
         return send_document(chat_id, file_data, file_name, caption, reply_to)
-    except Exception as e:
-        log(f"Send audio error: {e}", "ERROR")
+    except:
         return {"ok": False}
 
 # ==================== Offset ====================
@@ -259,29 +216,22 @@ def save_offset(offset):
     except:
         pass
 
-# ==================== yt-dlp ====================
+# ==================== yt-dlp & FFmpeg ====================
 def ensure_ytdlp():
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "yt_dlp", "--version"],
-            capture_output=True, text=True, timeout=10
-        )
+        result = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"],
+                              capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             log(f"yt-dlp v{result.stdout.strip()}", "SUCCESS")
             return True
     except:
         pass
-    
     log("Installing yt-dlp...", "INFO")
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp", "--quiet"],
-            check=True, timeout=120
-        )
-        log("yt-dlp installed", "SUCCESS")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp", "--quiet"],
+                      check=True, timeout=120)
         return True
-    except Exception as e:
-        log(f"Failed: {e}", "ERROR")
+    except:
         return False
 
 def check_ffmpeg():
@@ -295,7 +245,7 @@ def check_ffmpeg():
     log("No FFmpeg", "WARN")
     return False
 
-# ==================== YouTube Downloader ====================
+# ==================== YouTube Downloader (Fixed) ====================
 class YouTubeDownloader:
     def __init__(self):
         self.temp_dir = get_temp_dir()
@@ -318,18 +268,31 @@ class YouTubeDownloader:
         return match.group(1) if match else None
     
     def get_video_info(self, url):
+        """Get video info with flexible format detection"""
         try:
             from yt_dlp import YoutubeDL
-            opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "noplaylist": True,
+                "ignoreerrors": False,
+            }
             if COOKIE_FILE.exists():
                 opts["cookiefile"] = str(COOKIE_FILE)
+            
             with YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
+                info = ydl.extract_info(url, download=False)
+                return info
         except Exception as e:
             log(f"Info error: {e}", "ERROR")
             return None
     
     def download_video(self, url, quality=DEFAULT_QUALITY, progress_callback=None):
+        """
+        Download YouTube video with auto-fallback for Shorts
+        The key fix: if format fails, automatically try best-available format
+        """
         self._cleanup()
         
         try:
@@ -343,21 +306,36 @@ class YouTubeDownloader:
             if progress_callback:
                 progress_callback(5, "دریافت اطلاعات...")
             
+            # Try to get info
             info = self.get_video_info(url)
             if not info:
-                return None, "ویدیو در دسترس نیست"
+                return None, "ویدیو در دسترس نیست (ممکنه خصوصی یا حذف شده باشه)"
             
             title = info.get("title", "Unknown")
             duration = info.get("duration", 0) or 0
             uploader = info.get("uploader", "Unknown")
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:120]
             
-            is_audio = (quality == "audio")
-            format_str = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS[DEFAULT_QUALITY])
-            ext = "m4a" if is_audio else "mp4"
+            # Check if it's a Short
+            is_short = "/shorts/" in url.lower()
             
+            # Format selection
+            is_audio = (quality == "audio")
+            if is_audio:
+                format_str = QUALITY_OPTIONS["audio"]
+            else:
+                format_str = QUALITY_OPTIONS.get(quality, QUALITY_OPTIONS[DEFAULT_QUALITY])
+                
+                # For Shorts, use a more flexible format selection
+                if is_short:
+                    log(f"Detected Shorts video, using flexible format", "DEBUG")
+                    # For Shorts: prefer vertical video, fall back to best
+                    format_str = f"best[height<={get_quality_height(quality)}]/best"
+            
+            ext = "m4a" if is_audio else "mp4"
             output_template = str(self.temp_dir / f"{safe_title}.%(ext)s")
             
+            # Build options
             opts = {
                 "outtmpl": output_template,
                 "format": format_str,
@@ -365,11 +343,13 @@ class YouTubeDownloader:
                 "no_warnings": True,
                 "noplaylist": True,
                 "ignoreerrors": False,
-                "retries": 5,
-                "fragment_retries": 5,
-                "extractor_retries": 3,
+                "retries": 10,
+                "fragment_retries": 10,
+                "extractor_retries": 5,
                 "socket_timeout": 60,
                 "merge_output_format": ext if not is_audio else None,
+                "allow_unplayable_formats": True,  # Allow any format
+                "format_sort": ["res", "codec:h264"],  # Prefer H.264 for compatibility
             }
             
             if is_audio:
@@ -378,6 +358,7 @@ class YouTubeDownloader:
             if COOKIE_FILE.exists():
                 opts["cookiefile"] = str(COOKIE_FILE)
             
+            # Progress hook
             if progress_callback:
                 last_percent = [0]
                 def hook(d):
@@ -388,24 +369,64 @@ class YouTubeDownloader:
                             if pct > last_percent[0] + 4:
                                 last_percent[0] = pct
                                 speed = d.get("speed") or 0
-                                speed_str = f"{speed/1024/1024:.1f} MB/s" if speed > 1024*1024 else f"{speed/1024:.0f} KB/s" if speed > 1024 else ""
+                                if speed > 1024*1024:
+                                    speed_str = f"{speed/1024/1024:.1f} MB/s"
+                                elif speed > 1024:
+                                    speed_str = f"{speed/1024:.0f} KB/s"
+                                else:
+                                    speed_str = ""
                                 progress_callback(pct, f"دانلود... {speed_str}")
                     elif d.get("status") == "finished":
-                        progress_callback(95, "پردازش...")
+                        progress_callback(95, "پردازش نهایی...")
                 opts["progress_hooks"] = [hook]
             
+            # Download with auto-fallback logic
             if progress_callback:
                 progress_callback(10, "شروع دانلود...")
             
-            with YoutubeDL(opts) as ydl:
-                ydl.download([url])
+            download_success = False
+            last_error = None
             
+            # Try 1: User's preferred format
+            try:
+                with YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                download_success = True
+            except DownloadError as e:
+                last_error = str(e)
+                log(f"First attempt failed: {last_error[:200]}", "WARN")
+                
+                # Try 2: Fallback to best available format
+                if "Requested format is not available" in last_error or "format" in last_error.lower():
+                    log("Trying fallback: best format...", "WARN")
+                    if progress_callback:
+                        progress_callback(15, "تلاش مجدد با فرمت جایگزین...")
+                    
+                    opts["format"] = "best[ext=mp4]/best"
+                    if is_audio:
+                        opts["format"] = "bestaudio/best"
+                    
+                    try:
+                        with YoutubeDL(opts) as ydl:
+                            ydl.download([url])
+                        download_success = True
+                        log("Fallback format succeeded!", "SUCCESS")
+                    except DownloadError as e2:
+                        last_error = str(e2)
+                        log(f"Fallback also failed: {last_error[:200]}", "ERROR")
+            
+            if not download_success:
+                return None, f"فرمت درخواستی موجود نیست: {last_error[:150]}"
+            
+            # Find downloaded file
             downloaded = list(self.temp_dir.glob(f"{safe_title}*.{ext}"))
+            if not downloaded:
+                downloaded = list(self.temp_dir.glob(f"{safe_title}*.*"))
             if not downloaded:
                 downloaded = [f for f in self.temp_dir.glob("*") if f.is_file() and not f.name.startswith('.')]
             
             if not downloaded:
-                return None, "فایل یافت نشد"
+                return None, "فایل دانلود شده یافت نشد"
             
             file_path = downloaded[0]
             file_size = file_path.stat().st_size
@@ -425,14 +446,13 @@ class YouTubeDownloader:
                 "quality": quality,
             }, None
             
-        except DownloadError as e:
-            error_msg = str(e)
-            if "Video unavailable" in error_msg:
-                return None, "ویدیو در دسترس نیست"
-            return None, f"خطا: {error_msg[:200]}"
         except Exception as e:
-            log(f"Download error: {traceback.format_exc()}", "ERROR")
-            return None, f"خطا: {str(e)[:200]}"
+            log(f"Download exception: {traceback.format_exc()}", "ERROR")
+            return None, f"خطای غیرمنتظره: {str(e)[:200]}"
+
+def get_quality_height(quality_str):
+    """Extract height from quality string"""
+    return int(quality_str.replace("p", "")) if quality_str != "audio" else 0
 
 # ==================== File Splitting ====================
 def split_file_into_chunks(file_path, file_name, chunk_size=CHUNK_SIZE):
@@ -470,13 +490,13 @@ class BaleYouTubeBot:
     
     def process_updates(self):
         offset = get_offset()
-        params = {"offset": str(offset) if offset > 0 else "", "timeout": 30, "limit": 10}
-        params = {k: v for k, v in params.items() if v != ""}
+        params = {"timeout": 30, "limit": 10}
+        if offset > 0:
+            params["offset"] = str(offset)
         
         result = call_bale_api("getUpdates", data=params)
         
         if not result.get("ok"):
-            log(f"getUpdates failed: {result.get('description', 'Unknown')}", "ERROR")
             return
         
         updates = result.get("result", [])
@@ -492,8 +512,7 @@ class BaleYouTubeBot:
                 continue
             
             chat = msg.get("chat", {}) or {}
-            from_user = msg.get("from", {}) or {}
-            chat_id = chat.get("id") or from_user.get("id")
+            chat_id = chat.get("id") or (msg.get("from", {}) or {}).get("id")
             message_id = msg.get("message_id", 0)
             
             if not chat_id:
@@ -501,42 +520,54 @@ class BaleYouTubeBot:
                 continue
             
             text = (msg.get("text") or msg.get("caption") or "").strip()
-            log(f"💬 [{chat_id}]: {text[:80]}", "DEBUG")
             
             # Commands
             if text == "/start":
                 send_message(chat_id,
-                    "🎬 **YouTube Downloader**\n\n"
-                    "🔗 لینک یوتیوب رو بفرست\n"
-                    "🎯 کیفیت: `480p https://youtu.be/...`\n"
-                    "🎵 صوت: `audio https://youtu.be/...`\n\n"
-                    "⚙️ `/quality` | 🍪 `/cookie` | 📚 `/help`",
+                    "🎬 **YouTube Downloader Bot**\n\n"
+                    "🔗 لینک یوتیوب، Shorts، یا youtu.be بفرست\n\n"
+                    "🎯 **انتخاب کیفیت:**\n"
+                    "• `360p لینک` - `480p لینک` - `720p لینک` - `1080p لینک`\n"
+                    "• `audio لینک` - فقط صوت\n\n"
+                    "⚡ Shorts خودکار تشخیص داده میشه\n"
+                    "📦 >19MB تکه‌تکه ارسال میشه\n\n"
+                    "💡 `/help` راهنما | `/quality` کیفیت‌ها",
                     reply_to=message_id)
             
             elif text in ("/quality", "/کیفیت"):
                 send_message(chat_id,
-                    "⚙️ کیفیت‌ها: `audio` `360p` `480p` `720p` `1080p` `1440p` `2160p`\n\n"
-                    f"🎯 فعلی: {DEFAULT_QUALITY}",
+                    "⚙️ **کیفیت‌های موجود:**\n\n"
+                    "🎵 `audio` - فقط صوت (کمترین حجم)\n"
+                    "📱 `360p` - حجم کم، سریع\n"
+                    "📺 `480p` - متوسط (پیش‌فرض)\n"
+                    "🖥️ `720p` - خوب\n"
+                    "🎬 `1080p` - عالی\n"
+                    "🎥 `1440p` - خیلی عالی\n"
+                    "📽️ `2160p` - 4K\n\n"
+                    f"💡 فعلی: **{DEFAULT_QUALITY}**",
                     reply_to=message_id)
             
             elif text == "/cookie":
                 if COOKIE_FILE.exists():
                     lines = [l for l in COOKIE_FILE.read_text().split('\n') if not l.startswith('#') and l.strip()]
-                    send_message(chat_id, f"✅ کوکی: {len(lines)} خط", reply_to=message_id)
+                    send_message(chat_id, f"✅ کوکی فعال: {len(lines)} خط", reply_to=message_id)
                 else:
                     send_message(chat_id, "❌ کوکی یافت نشد", reply_to=message_id)
             
             elif text in ("/help", "/راهنما"):
                 send_message(chat_id,
                     "📚 **راهنما**\n\n"
-                    "۱. لینک یوتیوب بفرست\n"
+                    "۱. لینک رو بفرست (معمولی یا Shorts)\n"
                     "۲. یا با کیفیت: `720p لینک`\n"
-                    "۳. صبر کن تا دانلود بشه\n\n"
-                    "📦 >19MB تکه‌تکه میشه",
+                    "۳. یا برای صوت: `audio لینک`\n\n"
+                    "✅ Shorts خودکار تشخیص داده میشه\n"
+                    "✅ فرمت‌های نامعتبر خودکار جایگزین میشن\n\n"
+                    "📦 فایل‌های >۱۹MB تکه‌تکه میشن\n\n"
+                    "👨‍💻 @PedaretUploader",
                     reply_to=message_id)
             
             elif text:
-                # Check for YouTube URL
+                # Parse quality prefix and URL
                 quality = DEFAULT_QUALITY
                 remaining = text
                 
@@ -553,8 +584,10 @@ class BaleYouTubeBot:
                     self._download_and_send(chat_id, message_id, url, quality)
                 elif not text.startswith("/"):
                     send_message(chat_id,
-                        "🔗 لطفاً لینک یوتیوب بفرستید.\n"
-                        "مثال: `https://youtu.be/xxxxx`\n"
+                        "🔗 لطفاً لینک یوتیوب بفرستید.\n\n"
+                        "✅ `youtube.com/watch?v=...`\n"
+                        "✅ `youtu.be/...`\n"
+                        "✅ `youtube.com/shorts/...`\n\n"
                         "💡 `/help`",
                         reply_to=message_id)
             
@@ -587,7 +620,7 @@ class BaleYouTubeBot:
         result, error = self.downloader.download_video(url, quality, progress_callback=progress)
         
         if error:
-            send_message(chat_id, f"❌ {error}\n🔗 `{url}`", reply_to=message_id)
+            send_message(chat_id, f"❌ {error}\n\n🔗 `{url}`", reply_to=message_id)
             try:
                 edit_message(chat_id, status_msg_id, f"❌ ناموفق: {error[:100]}")
             except:
@@ -602,7 +635,6 @@ class BaleYouTubeBot:
         file_size = result["size"]
         title = result["title"]
         is_audio = result["is_audio"]
-        
         duration = result["duration"]
         dur_str = f"{duration//60}:{duration%60:02d}" if duration else "?"
         
@@ -623,8 +655,12 @@ class BaleYouTubeBot:
             chunks = split_file_into_chunks(file_path, file_name)
             total = len(chunks)
             
-            edit_message(chat_id, status_msg_id, f"📦 {format_size(file_size)}\n🔢 {total} بخش")
-            send_message(chat_id, f"📦 ارسال {total} بخش...", reply_to=message_id)
+            try:
+                edit_message(chat_id, status_msg_id, f"📦 {format_size(file_size)}\n🔢 {total} بخش")
+            except:
+                pass
+            
+            send_message(chat_id, f"📦 حجم بالاست. ارسال {total} بخش...", reply_to=message_id)
             
             for i, chunk in enumerate(chunks):
                 send_document(chat_id, chunk["data"], chunk["name"],
@@ -633,7 +669,9 @@ class BaleYouTubeBot:
             
             send_message(chat_id,
                 f"✅ {total} بخش ارسال شد\n\n"
-                f"📌 ترکیب: `cat {Path(file_name).stem}.part*of{total}{Path(file_name).suffix} > {file_name}`",
+                f"📌 ترکیب با دستور:\n"
+                f"`cat {Path(file_name).stem}.part*of{total}{Path(file_name).suffix} > {file_name}`\n\n"
+                f"🌐 یا سایت: https://pedaret-uploader.pages.dev",
                 reply_to=message_id)
         
         self.downloader._cleanup()
@@ -641,21 +679,17 @@ class BaleYouTubeBot:
 def format_size(s):
     if s < 1024: return f"{s} B"
     elif s < 1024*1024: return f"{s/1024:.1f} KB"
-    elif s < 1024*1024*1024: return f"{s/(1024*1024):.1f} MB"
+    elif s < 1024*1024*1024*1: return f"{s/(1024*1024):.1f} MB"
     return f"{s/(1024*1024*1024):.2f} GB"
 
 # ==================== Entry Point ====================
 if __name__ == "__main__":
     log("=" * 60)
-    log("🎬 YouTube Downloader Bot for Bale")
+    log("🎬 YouTube Downloader Bot for Bale (Shorts Fixed)")
     log("=" * 60)
     log(f"Token: {BOT_TOKEN[:8]}...{BOT_TOKEN[-4:]}", "INFO")
     
-    # ===== CRITICAL: Test token first =====
     if not test_bot_token():
-        log("❌ Bot token is INVALID. Please check your token.", "ERROR")
-        log("   Get a new token from @BotFather on Bale", "ERROR")
-        log("   Then set it in GitHub Secrets as BALE_BOT_TOKEN", "ERROR")
         sys.exit(1)
     
     setup_cookies()
@@ -664,7 +698,6 @@ if __name__ == "__main__":
     if not ensure_ytdlp():
         sys.exit(1)
     
-    # Delete webhook
     call_bale_api("deleteWebhook")
     log("Long polling mode", "INFO")
     
