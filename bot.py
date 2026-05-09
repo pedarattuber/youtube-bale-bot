@@ -1,547 +1,156 @@
-#!/usr/bin/env python3
-"""
-🎬 YouTube Downloader Bot for Bale (ABSOLUTE FINAL FIX)
-Uses subprocess with yt-dlp CLI directly - bypasses all format issues
-"""
-
+import telebot
+from telebot import apihelper
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import yt_dlp
 import os
-import io
-import re
-import sys
-import json
 import time
-import shutil
-import tempfile
-import zipfile
-import traceback
-import subprocess
-from pathlib import Path
-from datetime import datetime
+import glob
 
-import requests
+# دریافت توکن‌ها و تنظیم API پیام‌رسان بله
+TOKEN = os.getenv("BALE_BOT_TOKEN")
+apihelper.API_URL = "https://tapi.bale.ai/bot{0}/{1}"
+bot = telebot.TeleBot(TOKEN)
 
-# ==================== Configuration ====================
-BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    sys.exit("❌ BALE_BOT_TOKEN is required!")
+MAX_FILE_SIZE = 19 * 1024 * 1024  # 19 MB
 
-CHUNK_SIZE = 19 * 1024 * 1024
-MAX_ITERATIONS = 30
-BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
-
-YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
-COOKIE_FILE = Path.home() / ".youtube_cookies.txt"
-OFFSET_FILE = Path.home() / ".youtube_bale_bot_offset.txt"
-
-DEFAULT_QUALITY = "480p"
-
-# ==================== Logging ====================
-def log(msg, level="INFO"):
-    timestamp = datetime.now().strftime('%H:%M:%S')
-    emoji = {"INFO": "📘", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️"}
-    print(f"[{timestamp}] {emoji.get(level, '•')} {msg}", flush=True)
-
-# ==================== Temp ====================
-def get_temp_dir():
-    for path in [Path(tempfile.gettempdir()) / "yt_bot", Path.home() / ".yt_bot", Path("yt_temp")]:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            return path
-        except:
-            continue
-    return Path("yt_temp")
-
-# ==================== Cookies ====================
-def setup_cookies():
-    if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
-        try:
-            COOKIE_FILE.write_text(YOUTUBE_COOKIES.strip())
-            log(f"Cookies: {len(YOUTUBE_COOKIES)} chars", "SUCCESS")
-            return True
-        except:
-            pass
-    if COOKIE_FILE.exists():
-        content = COOKIE_FILE.read_text().strip()
-        lines = [l for l in content.split('\n') if l.strip() and not l.startswith('#')]
-        if len(lines) >= 3:
-            log(f"Cookies: {len(lines)} lines", "SUCCESS")
-            return True
-    return False
-
-# ==================== Bale API ====================
-def bale_get(method, data=None, files=None, retries=3):
-    url = f"{BASE_URL}/{method}"
-    for attempt in range(retries):
-        try:
-            if files:
-                resp = requests.post(url, data=data, files=files, timeout=180)
-            else:
-                resp = requests.post(url, json=data, timeout=30)
-            if resp.status_code == 200:
-                return resp.json()
-            time.sleep(2)
-        except:
-            time.sleep(2)
-    return {"ok": False}
-
-def send_msg(chat, text, reply=None):
-    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        payload = {"chat_id": str(chat), "text": chunk}
-        if reply: payload["reply_to_message_id"] = reply
-        bale_get("sendMessage", data=payload)
-        time.sleep(0.2)
-
-def edit_msg(chat, msg_id, text):
-    bale_get("editMessageText", data={"chat_id": str(chat), "message_id": msg_id, "text": text})
-
-def send_file(chat, data, name, caption="", reply=None):
-    if isinstance(data, (str, Path)):
-        with open(str(data), "rb") as f:
-            data = f.read()
-    payload = {"chat_id": str(chat)}
-    if caption: payload["caption"] = caption[:1024]
-    if reply: payload["reply_to_message_id"] = reply
-    return bale_get("sendDocument", data=payload, files={"document": (name, data, "application/octet-stream")})
-
-def send_vid(chat, data, name, caption="", reply=None):
-    if isinstance(data, (str, Path)):
-        with open(str(data), "rb") as f:
-            data = f.read()
-    payload = {"chat_id": str(chat), "supports_streaming": "true"}
-    if caption: payload["caption"] = caption[:1024]
-    if reply: payload["reply_to_message_id"] = reply
-    result = bale_get("sendVideo", data=payload, files={"video": (name, data, "video/mp4")})
-    if not result.get("ok"):
-        return send_file(chat, data, name, caption, reply)
-    return result
-
-def send_aud(chat, data, name, caption="", reply=None):
-    if isinstance(data, (str, Path)):
-        with open(str(data), "rb") as f:
-            data = f.read()
-    payload = {"chat_id": str(chat)}
-    if caption: payload["caption"] = caption[:1024]
-    if reply: payload["reply_to_message_id"] = reply
-    result = bale_get("sendAudio", data=payload, files={"audio": (name, data, "audio/mpeg")})
-    if not result.get("ok"):
-        return send_file(chat, data, name, caption, reply)
-    return result
-
-# ==================== Offset ====================
-def get_offset():
-    try: return int(OFFSET_FILE.read_text().strip()) if OFFSET_FILE.exists() else 0
-    except: return 0
-
-def save_offset(o):
-    try: OFFSET_FILE.write_text(str(o))
-    except: pass
-
-# ==================== Setup ====================
-def ensure_ytdlp():
-    try:
-        r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            log(f"yt-dlp v{r.stdout.strip()}", "SUCCESS")
-            return True
-    except:
-        pass
-    log("Installing yt-dlp...", "INFO")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "yt-dlp"], timeout=120)
-    return True
-
-# ==================== YouTube Download (SUBPROCESS METHOD) ====================
-def download_youtube(url, quality="480p", temp_dir=None, progress_callback=None):
-    """
-    Download using yt-dlp CLI directly.
-    This bypasses ALL Python module format issues.
-    """
-    if temp_dir is None:
-        temp_dir = get_temp_dir()
-    
-    # Clean temp
-    for f in temp_dir.iterdir():
-        try:
-            if f.is_file(): f.unlink()
-            elif f.is_dir(): shutil.rmtree(str(f), ignore_errors=True)
-        except: pass
-    
-    # Extract video ID
-    vid_match = re.search(r'[a-zA-Z0-9_-]{11}', url)
-    vid_id = vid_match.group(0) if vid_match else "video"
-    
-    # Output template
-    output = str(temp_dir / f"%(title)s_{vid_id}.%(ext)s")
-    
-    # Build yt-dlp command
-    cmd = [
-        "yt-dlp",
-        "-f", "b",  # BEST available format - ALWAYS works
-        "-o", output,
-        "--no-playlist",
-        "--merge-output-format", "mp4",
-        "--no-warnings",
-        "--no-progress",
-        "--socket-timeout", "30",
-        "-R", "5",
-        "--fragment-retries", "5",
-    ]
-    
-    # Handle audio-only
-    if quality == "audio":
-        cmd = [
-            "yt-dlp",
-            "-f", "ba",  # Best audio
-            "-o", output,
-            "--no-playlist",
-            "--extract-audio",
-            "--audio-format", "m4a",
-            "--no-warnings",
-            "--no-progress",
-            "--socket-timeout", "30",
-            "-R", "5",
-        ]
-    
-    # Cookiefile
-    if COOKIE_FILE.exists():
-        cmd.extend(["--cookies", str(COOKIE_FILE)])
-    
-    cmd.append(url)
-    
-    log(f"Running: {' '.join(cmd[:8])}...", "DEBUG")
-    
-    try:
-        # Run yt-dlp
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-        
-        # Read output for progress
-        download_started = False
-        for line in process.stderr:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Progress detection
-            if "%" in line and "MiB" in line:
-                download_started = True
+def get_progress_hook(chat_id, message_id):
+    last_edit_time = [0]
+    def hook(d):
+        if d['status'] == 'downloading':
+            current_time = time.time()
+            # آپدیت پیام هر 5 ثانیه برای جلوگیری از محدودیت‌های API
+            if current_time - last_edit_time[0] > 5:
+                percent = d.get('_percent_str', '0%').strip()
+                speed = d.get('_speed_str', '0KiB/s').strip()
+                text = f"⏳ در حال دانلود...\n📊 پیشرفت: {percent}\n🚀 سرعت: {speed}"
                 try:
-                    pct_match = re.search(r'(\d+\.?\d*)%', line)
-                    if pct_match and progress_callback:
-                        pct = min(float(pct_match.group(1)), 95)
-                        speed_match = re.search(r'(\d+\.?\d*\s*[KMG]iB/s)', line)
-                        speed = speed_match.group(1) if speed_match else ""
-                        progress_callback(int(pct), f"دانلود... {speed}")
+                    bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
                 except:
                     pass
-            elif "Destination:" in line:
-                download_started = True
-                if progress_callback:
-                    progress_callback(5, "شروع دریافت...")
-            elif "ERROR:" in line or "WARNING:" in line:
-                log(f"yt-dlp: {line}", "WARN")
-        
-        process.wait(timeout=300)
-        
-        if process.returncode != 0:
-            stderr_output = process.stderr.read() if hasattr(process.stderr, 'read') else ""
-            return None, f"yt-dlp failed: {stderr_output[:200]}"
-        
-        # Find downloaded file
-        downloaded = list(temp_dir.glob("*"))
-        media_files = [f for f in downloaded 
-                       if f.is_file() and f.suffix.lower() in 
-                       ('.mp4', '.mkv', '.webm', '.m4a', '.mp3', '.opus', '.aac')]
-        
-        if not media_files:
-            # Try broader search
-            media_files = [f for f in downloaded if f.is_file() and f.stat().st_size > 1000]
-        
-        if not media_files:
-            return None, "No output file found"
-        
-        file_path = media_files[0]
-        file_size = file_path.stat().st_size
-        
-        if progress_callback:
-            progress_callback(100, "✅ کامل شد")
-        
-        # Extract title from filename
-        title = file_path.stem
-        # Remove video ID from title
-        title = re.sub(rf'_{re.escape(vid_id)}$', '', title)
-        title = title.replace('_', ' ').strip()
-        
-        return {
-            "path": str(file_path),
-            "name": file_path.name,
-            "size": file_size,
-            "title": title or "YouTube Video",
-            "is_audio": quality == "audio",
-        }, None
-        
-    except subprocess.TimeoutExpired:
-        process.kill()
-        return None, "دانلود بیش از حد طول کشید (تایم‌اوت)"
-    except Exception as e:
-        log(f"Subprocess error: {traceback.format_exc()}", "ERROR")
-        return None, f"خطای سیستمی: {str(e)[:200]}"
+                last_edit_time[0] = current_time
+    return hook
 
-# ==================== Split File ====================
-def split_file(file_path, file_name, chunk_size=CHUNK_SIZE):
-    chunks = []
-    with open(str(file_path), "rb") as f:
-        data = f.read()
-    
-    total = len(data)
-    total_chunks = max(1, (total + chunk_size - 1) // chunk_size)
-    base = Path(file_name).stem
-    ext = Path(file_name).suffix
-    
-    for i in range(total_chunks):
-        chunk_data = data[i*chunk_size:(i+1)*chunk_size]
-        zip_name = f"{base}.part{i+1}of{total_chunks}{ext}.zip"
-        inner_name = f"{base}.part{i+1}of{total_chunks}{ext}"
-        
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-            zf.writestr(inner_name, chunk_data)
-        
-        chunks.append({"name": zip_name, "data": buf.getvalue(), "size": len(buf.getvalue())})
-    
-    return chunks
+def split_file(file_path, chunk_size=MAX_FILE_SIZE):
+    parts = []
+    with open(file_path, 'rb') as f:
+        part_num = 1
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            part_name = f"{file_path}.part{part_num:03d}"
+            with open(part_name, 'wb') as p:
+                p.write(chunk)
+            parts.append(part_name)
+            part_num += 1
+    return parts
 
-# ==================== Progress Bar ====================
-def bar(pct, w=12):
-    f = int(w * pct / 100)
-    return f"[{'█'*f}{'░'*(w-f)}] {pct}%"
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    bot.reply_to(message, "سلام! 🎬\nلینک ویدیوی یوتوب رو بفرست تا اطلاعاتش رو بگیرم و برای دانلود آمادش کنم.")
 
-# ==================== Main Bot ====================
-YT_URL = re.compile(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})', re.I)
-QUALITIES = {"audio", "360p", "480p", "720p", "1080p"}
-
-def process_updates():
-    offset = get_offset()
-    params = {"timeout": 30, "limit": 10}
-    if offset > 0:
-        params["offset"] = str(offset)
+@bot.message_handler(func=lambda message: "youtube.com" in message.text or "youtu.be" in message.text)
+def process_link(message):
+    url = message.text.strip()
+    msg = bot.reply_to(message, "🔎 در حال استخراج اطلاعات ویدیو... لطفا کمی صبر کنید.")
     
-    result = bale_get("getUpdates", data=params)
-    if not result.get("ok"):
-        return
+    ydl_opts = {
+        'cookiefile': 'cookies.txt',
+        'quiet': True,
+        'no_warnings': True,
+    }
     
-    updates = result.get("result", [])
-    if updates:
-        log(f"📨 {len(updates)} messages", "INFO")
-    
-    for upd in updates:
-        uid = upd.get("update_id", 0)
-        msg = upd.get("message") or upd.get("channel_post") or {}
-        
-        if not msg:
-            save_offset(uid + 1)
-            continue
-        
-        chat_id = (msg.get("chat", {}) or {}).get("id") or (msg.get("from", {}) or {}).get("id")
-        msg_id = msg.get("message_id", 0)
-        text = (msg.get("text") or "").strip()
-        
-        if not chat_id:
-            save_offset(uid + 1)
-            continue
-        
-        # === Commands ===
-        if text == "/start":
-            send_msg(chat_id,
-                "🎬 **YouTube Downloader**\n\n"
-                "✅ همه نوع ویدیو: معمولی، Shorts، youtu.be\n"
-                "✅ کیفیت: `360p` `480p` `720p` `1080p` `audio`\n"
-                "✅ فرمت نامعتبر → خودکار best جایگزین میشه\n\n"
-                "🎯 مثال:\n`480p https://youtu.be/xxx`\n`audio https://youtube.com/shorts/xxx`\n\n"
-                "💡 `/help` | `/quality`",
-                reply=msg_id)
-        
-        elif text == "/quality":
-            send_msg(chat_id,
-                f"⚙️ کیفیت‌ها: `audio` `360p` `480p` `720p` `1080p`\n"
-                f"💡 پیش‌فرض: {DEFAULT_QUALITY}",
-                reply=msg_id)
-        
-        elif text == "/cookie":
-            if COOKIE_FILE.exists():
-                send_msg(chat_id, "✅ کوکی فعاله", reply=msg_id)
-            else:
-                send_msg(chat_id, "❌ کوکی نیست", reply=msg_id)
-        
-        elif text == "/help":
-            send_msg(chat_id,
-                "📚 **راهنما**\n\n"
-                "۱. لینک رو بفرست\n"
-                "۲. کیفیت: `720p لینک`\n"
-                "۳. صوت: `audio لینک`\n\n"
-                "📦 بزرگتر از ۱۹MB → تکه‌تکه",
-                reply=msg_id)
-        
-        elif text:
-            # Parse quality
-            q = DEFAULT_QUALITY
-            remaining = text
-            for qual in sorted(QUALITIES, key=len, reverse=True):
-                if remaining.lower().startswith(qual.lower()):
-                    q = qual
-                    remaining = remaining[len(qual):].strip()
-                    break
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'ویدیوی ناشناس')
+            thumbnail = info.get('thumbnail')
+            video_id = info.get('id')
             
-            match = YT_URL.search(remaining)
-            if match:
-                url = f"https://youtube.com/watch?v={match.group(1)}"
-                download_and_send(chat_id, msg_id, url, q)
-            elif not text.startswith("/"):
-                send_msg(chat_id, "🔗 لینک یوتیوب بفرستید\n💡 `/help`", reply=msg_id)
-        
-        save_offset(uid + 1)
-    
-    if updates:
-        save_offset(max(u["update_id"] for u in updates) + 1)
+            # ساخت دکمه‌های شیشه‌ای
+            markup = InlineKeyboardMarkup()
+            markup.row_width = 2
+            btn_360 = InlineKeyboardButton("کیفیت 360p", callback_data=f"dl_18_{video_id}")
+            btn_720 = InlineKeyboardButton("کیفیت 720p", callback_data=f"dl_22_{video_id}")
+            btn_audio = InlineKeyboardButton("🎵 فقط صدا", callback_data=f"dl_140_{video_id}")
+            markup.add(btn_360, btn_720, btn_audio)
 
-def download_and_send(chat_id, msg_id, url, quality):
-    q_disp = "🎵 صوت" if quality == "audio" else f"🎬 {quality}"
+            caption = f"🎥 **عنوان:** {title}\n\n👇 یکی از کیفیت‌های زیر را انتخاب کنید:"
+            
+            bot.delete_message(message.chat.id, msg.message_id)
+            if thumbnail:
+                bot.send_photo(message.chat.id, photo=thumbnail, caption=caption, reply_markup=markup, parse_mode="Markdown")
+            else:
+                bot.send_message(message.chat.id, caption, reply_markup=markup, parse_mode="Markdown")
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ خطا در دریافت اطلاعات:\n`{str(e)}`", message.chat.id, msg.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('dl_'))
+def handle_download(call):
+    data = call.data.split('_')
+    format_id = data[1]
+    video_id = data[2]
+    url = f"https://youtu.be/{video_id}"
     
-    status = send_msg(chat_id, f"{q_disp}\n🔗 {url}\n\n{bar(0)}\n⏳ شروع...")
-    if not status or not status.get("ok"):
-        return
+    msg = bot.send_message(call.message.chat.id, "🔄 در حال آماده‌سازی برای دانلود...")
     
-    status_msg_id = status["result"]["message_id"]
-    start = time.time()
-    
-    def progress(pct, txt):
-        try:
-            edit_msg(chat_id, status_msg_id,
-                f"{q_disp}\n🔗 {url}\n\n{bar(pct)}\n⚡ {txt}\n⏱ {int(time.time()-start)}s")
-        except:
-            pass
-    
-    temp_dir = get_temp_dir()
-    result, error = download_youtube(url, quality, temp_dir, progress_callback=progress)
-    
-    if error:
-        send_msg(chat_id, f"❌ {error}", reply=msg_id)
-        try:
-            edit_msg(chat_id, status_msg_id, f"❌ {error[:100]}")
-        except:
-            pass
-        return
-    
-    if not result:
-        send_msg(chat_id, "❌ دانلود ناموفق", reply=msg_id)
-        return
-    
-    file_path = result["path"]
-    file_name = result["name"]
-    file_size = result["size"]
-    title = result["title"]
-    is_audio = result["is_audio"]
-    
-    caption = f"🎬 {title}\n📦 {format_size(file_size)}"
-    
-    if file_size <= CHUNK_SIZE:
-        progress(99, "📤 ارسال...")
-        if is_audio:
-            send_aud(chat_id, file_path, file_name, caption, reply=msg_id)
-        else:
-            send_vid(chat_id, file_path, file_name, caption, reply=msg_id)
-        
-        try:
-            edit_msg(chat_id, status_msg_id, f"✅ {title}\n📦 {format_size(file_size)}")
-        except:
-            pass
-    else:
-        chunks = split_file(file_path, file_name)
-        total = len(chunks)
-        
-        try:
-            edit_msg(chat_id, status_msg_id, f"📦 {format_size(file_size)}\n🔢 {total} بخش")
-        except:
-            pass
-        
-        send_msg(chat_id, f"📦 ارسال {total} بخش...", reply=msg_id)
-        
-        for i, chunk in enumerate(chunks):
-            send_file(chat_id, chunk["data"], chunk["name"],
-                f"📤 {title}\nبخش {i+1}/{total}")
-            time.sleep(1)
-        
-        send_msg(chat_id,
-            f"✅ {total} بخش ارسال شد\n\n"
-            f"📌 ترکیب:\n`cat {Path(file_name).stem}.part*of{total}{Path(file_name).suffix} > {file_name}`",
-            reply=msg_id)
-    
-    # Cleanup
+    filename_template = f"{video_id}.%(ext)s"
+    ydl_opts = {
+        'format': format_id,
+        'outtmpl': filename_template,
+        'cookiefile': 'cookies.txt',
+        'progress_hooks': [get_progress_hook(call.message.chat.id, msg.message_id)],
+        'quiet': True,
+    }
+
     try:
-        for f in temp_dir.iterdir():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            downloaded_file = ydl.prepare_filename(info)
+
+        bot.edit_message_text("✅ دانلود تمام شد. در حال بررسی حجم برای آپلود...", chat_id=call.message.chat.id, message_id=msg.message_id)
+        
+        file_size = os.path.getsize(downloaded_file)
+        
+        if file_size <= MAX_FILE_SIZE:
+            bot.edit_message_text("📤 در حال آپلود ویدیو...", chat_id=call.message.chat.id, message_id=msg.message_id)
+            with open(downloaded_file, 'rb') as f:
+                bot.send_document(call.message.chat.id, f)
+            bot.delete_message(call.message.chat.id, msg.message_id)
+        else:
+            bot.edit_message_text("✂️ حجم فایل بیشتر از ۱۹ مگابایت است. در حال تکه‌تکه کردن...", chat_id=call.message.chat.id, message_id=msg.message_id)
+            parts = split_file(downloaded_file)
+            total_parts = len(parts)
+            
+            for index, part in enumerate(parts):
+                bot.edit_message_text(f"📤 در حال آپلود پارت {index + 1} از {total_parts}...", chat_id=call.message.chat.id, message_id=msg.message_id)
+                with open(part, 'rb') as p:
+                    bot.send_document(call.message.chat.id, p)
+            
+            filename_base = os.path.basename(downloaded_file)
+            merge_instructions = (
+                f"🎉 آپلود تمام پارت‌ها با موفقیت انجام شد.\n\n"
+                f"🔧 **راهنمای ترکیب فایل‌ها:**\n"
+                f"ابتدا همه فایل‌ها را در یک پوشه دانلود کنید. سپس بر اساس سیستم‌عامل خود دستورات زیر را در ترمینال یا CMD وارد کنید:\n\n"
+                f"🖥 **در ویندوز:**\n"
+                f"`copy /b {filename_base}.part* {filename_base}`\n\n"
+                f"🐧 **در لینوکس، مک و ترموکس:**\n"
+                f"`cat {filename_base}.part* > {filename_base}`"
+            )
+            bot.send_message(call.message.chat.id, merge_instructions, parse_mode="Markdown")
+            bot.delete_message(call.message.chat.id, msg.message_id)
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ خطا در دانلود یا آپلود:\n`{str(e)}`", call.message.chat.id, msg.message_id)
+    
+    finally:
+        # پاکسازی فایل‌های دانلودی از روی سرور گیتهاب اکشن
+        for f in glob.glob(f"{video_id}*"):
             try:
-                if f.is_file(): f.unlink()
-                elif f.is_dir(): shutil.rmtree(str(f), ignore_errors=True)
-            except: pass
-    except: pass
+                os.remove(f)
+            except:
+                pass
 
-def format_size(s):
-    if s < 1024: return f"{s} B"
-    elif s < 1024*1024: return f"{s/1024:.1f} KB"
-    elif s < 1024*1024*1024: return f"{s/(1024*1024):.1f} MB"
-    return f"{s/(1024*1024*1024):.2f} GB"
-
-# ==================== Entry ====================
-if __name__ == "__main__":
-    log("=" * 50)
-    log("🎬 YouTube Bot - CLI Method (Final)")
-    log("=" * 50)
-    
-    # Test token
-    try:
-        r = requests.get(f"https://tapi.bale.ai/bot{BOT_TOKEN}/getMe", timeout=10)
-        if r.status_code == 200 and r.json().get("ok"):
-            bot = r.json()["result"]
-            log(f"✅ @{bot['username']}", "SUCCESS")
-        else:
-            log("❌ Invalid token", "ERROR")
-            sys.exit(1)
-    except:
-        log("❌ Cannot verify token", "ERROR")
-        sys.exit(1)
-    
-    setup_cookies()
-    
-    # Check ffmpeg
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-        log("✅ FFmpeg OK", "SUCCESS")
-    except:
-        log("⚠️ FFmpeg missing", "WARN")
-    
-    ensure_ytdlp()
-    
-    # Delete webhook
-    try:
-        requests.post(f"{BASE_URL}/deleteWebhook")
-    except:
-        pass
-    
-    log("Polling...", "INFO")
-    
-    for i in range(MAX_ITERATIONS):
-        try:
-            process_updates()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log(f"Loop {i+1}: {e}", "ERROR")
-        
-        if i < MAX_ITERATIONS - 1:
-            time.sleep(2)
-    
-    log("Done", "SUCCESS")
+print("Bot is running on Bale...")
+bot.infinity_polling(timeout=60, long_polling_timeout=60)
